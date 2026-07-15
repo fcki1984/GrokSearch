@@ -23,7 +23,11 @@ class Config:
     def config_file(self) -> Path:
         if self._config_file is None:
             config_dir = Path.home() / ".config" / "grok-search"
-            config_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                config_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                config_dir = Path.cwd() / ".grok-search"
+                config_dir.mkdir(parents=True, exist_ok=True)
             self._config_file = config_dir / "config.json"
         return self._config_file
 
@@ -81,11 +85,23 @@ class Config:
 
     @property
     def tavily_enabled(self) -> bool:
-        return os.getenv("TAVILY_ENABLED", "false").lower() in ("true", "1", "yes")
+        return os.getenv("TAVILY_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    @property
+    def tavily_api_url(self) -> str:
+        return os.getenv("TAVILY_API_URL", "https://api.tavily.com")
 
     @property
     def tavily_api_key(self) -> str | None:
         return os.getenv("TAVILY_API_KEY")
+
+    @property
+    def firecrawl_api_url(self) -> str:
+        return os.getenv("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2")
+
+    @property
+    def firecrawl_api_key(self) -> str | None:
+        return os.getenv("FIRECRAWL_API_KEY")
 
     @property
     def log_level(self) -> str:
@@ -94,31 +110,55 @@ class Config:
     @property
     def log_dir(self) -> Path:
         log_dir_str = os.getenv("GROK_LOG_DIR", "logs")
-        if Path(log_dir_str).is_absolute():
-            return Path(log_dir_str)
-        user_log_dir = Path.home() / ".config" / "grok-search" / log_dir_str
-        user_log_dir.mkdir(parents=True, exist_ok=True)
-        return user_log_dir
+        log_dir = Path(log_dir_str)
+        if log_dir.is_absolute():
+            return log_dir
+
+        home_log_dir = Path.home() / ".config" / "grok-search" / log_dir_str
+        try:
+            home_log_dir.mkdir(parents=True, exist_ok=True)
+            return home_log_dir
+        except OSError:
+            pass
+
+        cwd_log_dir = Path.cwd() / log_dir_str
+        try:
+            cwd_log_dir.mkdir(parents=True, exist_ok=True)
+            return cwd_log_dir
+        except OSError:
+            pass
+
+        tmp_log_dir = Path("/tmp") / "grok-search" / log_dir_str
+        tmp_log_dir.mkdir(parents=True, exist_ok=True)
+        return tmp_log_dir
+
+    def _apply_model_suffix(self, model: str) -> str:
+        try:
+            url = self.grok_api_url
+        except ValueError:
+            return model
+        if "openrouter" in url and ":online" not in model:
+            return f"{model}:online"
+        return model
 
     @property
     def grok_model(self) -> str:
         if self._cached_model is not None:
             return self._cached_model
 
-        config_data = self._load_config_file()
-        file_model = config_data.get("model")
-        if file_model:
-            self._cached_model = file_model
-            return file_model
-
-        self._cached_model = self._DEFAULT_MODEL
-        return self._DEFAULT_MODEL
+        model = (
+            os.getenv("GROK_MODEL")
+            or self._load_config_file().get("model")
+            or self._DEFAULT_MODEL
+        )
+        self._cached_model = self._apply_model_suffix(model)
+        return self._cached_model
 
     def set_model(self, model: str) -> None:
         config_data = self._load_config_file()
         config_data["model"] = model
         self._save_config_file(config_data)
-        self._cached_model = model
+        self._cached_model = self._apply_model_suffix(model)
 
     @staticmethod
     def _mask_api_key(key: str) -> str:
@@ -146,8 +186,11 @@ class Config:
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
+            "TAVILY_API_URL": self.tavily_api_url,
             "TAVILY_ENABLED": self.tavily_enabled,
             "TAVILY_API_KEY": self._mask_api_key(self.tavily_api_key) if self.tavily_api_key else "未配置",
+            "FIRECRAWL_API_URL": self.firecrawl_api_url,
+            "FIRECRAWL_API_KEY": self._mask_api_key(self.firecrawl_api_key) if self.firecrawl_api_key else "未配置",
             "config_status": config_status
         }
 
