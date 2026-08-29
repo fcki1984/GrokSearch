@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict
 
 
 class SearchResult:
@@ -33,7 +33,7 @@ class BaseSearchProvider(ABC):
         self.api_key = api_key
 
     @abstractmethod
-    async def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+    async def search(self, query: str, max_results: int = 5) -> str:
         pass
 
     @abstractmethod
