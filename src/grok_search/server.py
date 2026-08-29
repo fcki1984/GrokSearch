@@ -150,7 +150,7 @@ async def web_search(
     grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
 
     # 计算额外信源配额
-    has_tavily = bool(config.tavily_api_key)
+    has_tavily = config.tavily_enabled and bool(config.tavily_api_key)
     has_firecrawl = bool(config.firecrawl_api_key)
     firecrawl_count = 0
     tavily_count = 0
@@ -164,12 +164,6 @@ async def web_search(
             tavily_count = extra_sources
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
-        try:
-            return await grok_provider.search(query, platform)
-        except Exception:
-            return ""
-
     async def _safe_tavily() -> list[dict] | None:
         try:
             if tavily_count:
@@ -184,7 +178,7 @@ async def web_search(
         except Exception:
             return None
 
-    coros: list = [_safe_grok()]
+    coros: list = [grok_provider.search(query, platform)]
     if tavily_count > 0:
         coros.append(_safe_tavily())
     if firecrawl_count > 0:
@@ -237,7 +231,7 @@ async def _call_tavily_extract(url: str) -> str | None:
     import httpx
     api_url = config.tavily_api_url
     api_key = config.tavily_api_key
-    if not api_key:
+    if not config.tavily_enabled or not api_key:
         return None
     endpoint = f"{api_url.rstrip('/')}/extract"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -258,7 +252,7 @@ async def _call_tavily_extract(url: str) -> str | None:
 async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | None:
     import httpx
     api_key = config.tavily_api_key
-    if not api_key:
+    if not config.tavily_enabled or not api_key:
         return None
     endpoint = f"{config.tavily_api_url.rstrip('/')}/search"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -330,6 +324,12 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
                 if markdown and markdown.strip():
                     return markdown
                 await log_info(ctx, f"Firecrawl: markdown为空, 重试 {attempt + 1}/{max_retries}", config.debug_enabled)
+        except httpx.HTTPStatusError as e:
+            await log_info(ctx, f"Firecrawl HTTP error: {e.response.status_code}", config.debug_enabled)
+            if e.response.status_code not in {408, 429, 500, 502, 503, 504}:
+                return None
+        except httpx.TransportError as e:
+            await log_info(ctx, f"Firecrawl error: {e}", config.debug_enabled)
         except Exception as e:
             await log_info(ctx, f"Firecrawl error: {e}", config.debug_enabled)
             return None
@@ -383,6 +383,8 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
     import json
     api_url = config.tavily_api_url
     api_key = config.tavily_api_key
+    if not config.tavily_enabled:
+        return "配置错误: Tavily 已禁用"
     if not api_key:
         return "配置错误: TAVILY_API_KEY 未配置，请设置环境变量 TAVILY_API_KEY"
     endpoint = f"{api_url.rstrip('/')}/map"

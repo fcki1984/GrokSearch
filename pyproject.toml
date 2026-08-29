@@ -9,9 +9,9 @@ description = "MCP server for AI model search capabilities"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=2.3.0",
+    "fastmcp==3.4.7",
     "httpx[socks]>=0.28.0",
-    "mcp[cli]>=1.21.2",
+    "mcp==1.29.1",
     "tenacity>=8.0.0",
 ]
 
