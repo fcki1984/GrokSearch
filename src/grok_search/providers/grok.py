@@ -149,7 +149,11 @@ class GrokSearchProvider(BaseSearchProvider):
             "stream": True,
         }
 
-        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
+        await log_info(
+            ctx,
+            f"search request: query_chars={len(query)}, platform_chars={len(platform_prompt)}",
+            config.debug_enabled,
+        )
 
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
@@ -190,6 +194,25 @@ class GrokSearchProvider(BaseSearchProvider):
                     # 去掉 "data:" 前缀，并去除可能的空格
                     json_str = line[5:].lstrip()
                     data = json.loads(json_str)
+                    error = data.get("error")
+                    if error is not None:
+                        def safe_detail(value):
+                            if not isinstance(value, (str, int, float, bool)):
+                                return ""
+                            return str(value).replace("\r", " ").replace("\n", " ")[:200]
+
+                        if isinstance(error, dict):
+                            parts = []
+                            for key in ("code", "type", "message"):
+                                value = safe_detail(error.get(key))
+                                if value:
+                                    parts.append(f"{key}={value}")
+                            details = ", ".join(parts)[:512]
+                        else:
+                            details = safe_detail(error)
+                        raise RuntimeError(
+                            f"Grok upstream stream error: {details or 'unknown error'}"
+                        )
                     choices = data.get("choices", [])
                     if choices and len(choices) > 0:
                         delta = choices[0].get("delta", {})
@@ -208,7 +231,11 @@ class GrokSearchProvider(BaseSearchProvider):
             except json.JSONDecodeError:
                 pass
         
-        await log_info(ctx, f"content: {content}", config.debug_enabled)
+        await log_info(
+            ctx,
+            f"search response: content_chars={len(content)}",
+            config.debug_enabled,
+        )
 
         return content
 

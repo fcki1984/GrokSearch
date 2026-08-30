@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from fastmcp import Client
@@ -129,6 +131,36 @@ async def test_streaming_parser_ignores_empty_and_usage_events():
     provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
 
     assert await provider._parse_streaming_response(StreamingResponse()) == "hello"
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_raises_for_upstream_error():
+    nested_marker = "PRIVATE_NESTED_ERROR_MARKER"
+    extra_marker = "PRIVATE_EXTRA_ERROR_MARKER"
+
+    class StreamingResponse:
+        async def aiter_lines(self):
+            payload = {
+                "error": {
+                    "code": "upstream_stream_interrupted" + "x" * 500,
+                    "type": "server_error",
+                    "message": {"private": nested_marker},
+                    "debug": extra_marker,
+                }
+            }
+            yield f"data: {json.dumps(payload)}"
+
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await provider._parse_streaming_response(StreamingResponse())
+
+    error_text = str(exc_info.value)
+    assert "Grok upstream stream error" in error_text
+    assert "upstream_stream_interrupted" in error_text
+    assert nested_marker not in error_text
+    assert extra_marker not in error_text
+    assert len(error_text) <= 550
 
 
 @pytest.mark.asyncio
