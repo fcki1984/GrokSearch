@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -6,6 +7,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 import grok_search.server as server
+import grok_search.providers.grok as grok_module
 from grok_search.providers.grok import GrokSearchProvider, _is_retryable_exception
 
 
@@ -219,6 +221,65 @@ async def test_streaming_parser_distinguishes_post_start_protocol_errors():
         await provider._parse_streaming_response(StreamingResponse(started=False))
 
     assert _is_retryable_exception(pre_start.value)
+
+
+@pytest.mark.asyncio
+async def test_grok_requests_fail_fast_while_another_stream_is_active(monkeypatch):
+    parser_started = asyncio.Event()
+    release_parser = asyncio.Event()
+    client_count = 0
+    stream_count = 0
+
+    class StreamingResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            parser_started.set()
+            await release_parser.wait()
+            yield 'data: {"choices": [{"delta": {"content": "hello"}}]}'
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            nonlocal client_count
+            client_count += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, *args, **kwargs):
+            nonlocal stream_count
+            stream_count += 1
+            return StreamingResponse()
+
+    monkeypatch.setattr(grok_module.httpx, "AsyncClient", FakeAsyncClient)
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    first = asyncio.create_task(provider._execute_stream_with_retry({}, {}))
+    await asyncio.wait_for(parser_started.wait(), timeout=1.0)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Grok request busy: another request is already in progress$",
+    ) as busy:
+        await asyncio.wait_for(provider._execute_stream_with_retry({}, {}), timeout=0.2)
+
+    assert not _is_retryable_exception(busy.value)
+    assert (client_count, stream_count) == (1, 1)
+
+    release_parser.set()
+    assert await first == "hello"
+    assert await provider._execute_stream_with_retry({}, {}) == "hello"
+    assert (client_count, stream_count) == (2, 2)
 
 
 @pytest.mark.asyncio

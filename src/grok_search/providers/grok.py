@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import json
 from datetime import datetime, timezone
@@ -68,6 +69,7 @@ def _needs_time_context(query: str) -> bool:
     return False
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_grok_request_lock = asyncio.Lock()
 
 
 def _is_retryable_exception(exc) -> bool:
@@ -253,24 +255,28 @@ class GrokSearchProvider(BaseSearchProvider):
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的流式 HTTP 请求"""
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+        if _grok_request_lock.locked():
+            raise RuntimeError("Grok request busy: another request is already in progress")
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
-                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                retry=retry_if_exception(_is_retryable_exception),
-                reraise=True,
-            ):
-                with attempt:
-                    async with client.stream(
-                        "POST",
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
+        async with _grok_request_lock:
+            timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(config.retry_max_attempts + 1),
+                    wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                    retry=retry_if_exception(_is_retryable_exception),
+                    reraise=True,
+                ):
+                    with attempt:
+                        async with client.stream(
+                            "POST",
+                            f"{self.api_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        ) as response:
+                            response.raise_for_status()
+                            return await self._parse_streaming_response(response, ctx)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
