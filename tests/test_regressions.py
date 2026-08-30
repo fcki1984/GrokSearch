@@ -11,18 +11,25 @@ from grok_search.providers.grok import GrokSearchProvider
 async def test_web_search_reports_grok_failure(monkeypatch):
     monkeypatch.setenv("GROK_API_URL", "https://grok.invalid")
     monkeypatch.setenv("GROK_API_KEY", "test-grok-key")
+    calls = []
 
     async def fail_search(self, query, platform=""):
+        calls.append((query, platform))
         raise RuntimeError("synthetic Grok failure")
 
     monkeypatch.setattr(GrokSearchProvider, "search", fail_search)
 
     async with Client(server.mcp) as client:
         try:
-            result = await client.call_tool("web_search", {"query": "test query"})
+            result = await client.call_tool(
+                "web_search",
+                {"query": "test query", "platform": "GitHub"},
+            )
         except ToolError:
+            assert calls == [("test query", "GitHub")]
             return
 
+    assert calls == [("test query", "GitHub")]
     assert result.is_error, "Grok failures must not become empty successful results"
 
 
@@ -129,12 +136,6 @@ async def test_server_registers_exact_tool_surface():
     expected = {
         "get_config_info",
         "get_sources",
-        "plan_complexity",
-        "plan_execution",
-        "plan_intent",
-        "plan_search_term",
-        "plan_sub_query",
-        "plan_tool_mapping",
         "switch_model",
         "toggle_builtin_tools",
         "web_fetch",

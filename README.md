@@ -156,7 +156,7 @@ claude mcp list
 ## 三、MCP 工具介绍
 
 <details>
-<summary>本项目提供八个 MCP 工具（展开查看）</summary>
+<summary>本项目提供七个 MCP 工具（展开查看）</summary>
 
 ### `web_search` — AI 网络搜索
 
@@ -232,9 +232,9 @@ claude mcp list
 
 修改项目级 `.claude/settings.json` 的 `permissions.deny`，一键禁用 Claude Code 官方的 WebSearch 和 WebFetch。
 
-### `search_planning` — 搜索规划
+### 直接搜索
 
-结构化搜索规划脚手架（分阶段、多轮），用于在执行复杂搜索前先生成可执行的搜索计划。
+直接调用 `web_search` 执行搜索；需要聚焦特定网站时传入 `platform`，需要查看信源时再用返回的 `session_id` 调用 `get_sources`。
 </details>
 
 ## 四、常见问题
