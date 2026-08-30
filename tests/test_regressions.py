@@ -137,30 +137,57 @@ async def test_streaming_parser_ignores_empty_and_usage_events():
 async def test_streaming_response_raises_for_upstream_error():
     nested_marker = "PRIVATE_NESTED_ERROR_MARKER"
     extra_marker = "PRIVATE_EXTRA_ERROR_MARKER"
-
-    class StreamingResponse:
-        async def aiter_lines(self):
-            payload = {
+    payloads = (
+        (
+            {
                 "error": {
                     "code": "upstream_stream_interrupted" + "x" * 500,
                     "type": "server_error",
                     "message": {"private": nested_marker},
                     "debug": extra_marker,
                 }
-            }
-            yield f"data: {json.dumps(payload)}"
+            },
+            "upstream_stream_interrupted",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": "response_failed" + "x" * 500,
+                        "type": "server_error",
+                        "message": "response failed",
+                        "details": {"private": nested_marker},
+                        "debug": extra_marker,
+                    },
+                },
+            },
+            "response_failed",
+        ),
+    )
+
+    class StreamingResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def aiter_lines(self):
+            if self.payload.get("type") == "response.failed":
+                yield "event: response.failed"
+            yield f"data: {json.dumps(self.payload)}"
 
     provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
 
-    with pytest.raises(RuntimeError) as exc_info:
-        await provider._parse_streaming_response(StreamingResponse())
+    for payload, expected_code in payloads:
+        with pytest.raises(RuntimeError) as exc_info:
+            await provider._parse_streaming_response(StreamingResponse(payload))
 
-    error_text = str(exc_info.value)
-    assert "Grok upstream stream error" in error_text
-    assert "upstream_stream_interrupted" in error_text
-    assert nested_marker not in error_text
-    assert extra_marker not in error_text
-    assert len(error_text) <= 550
+        error_text = str(exc_info.value)
+        assert "Grok upstream stream error" in error_text
+        assert expected_code in error_text
+        assert nested_marker not in error_text
+        assert extra_marker not in error_text
+        assert len(error_text) <= 550
 
 
 @pytest.mark.asyncio

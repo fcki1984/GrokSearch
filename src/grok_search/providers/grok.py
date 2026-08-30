@@ -195,7 +195,11 @@ class GrokSearchProvider(BaseSearchProvider):
                     json_str = line[5:].lstrip()
                     data = json.loads(json_str)
                     error = data.get("error")
-                    if error is not None:
+                    is_response_failure = data.get("type") == "response.failed"
+                    if is_response_failure:
+                        response_data = data.get("response")
+                        error = response_data.get("error") if isinstance(response_data, dict) else None
+                    if error is not None or is_response_failure:
                         def safe_detail(value):
                             if not isinstance(value, (str, int, float, bool)):
                                 return ""
