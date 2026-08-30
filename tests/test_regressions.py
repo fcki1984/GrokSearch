@@ -1,10 +1,14 @@
+import asyncio
+import json
+
 import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 import grok_search.server as server
-from grok_search.providers.grok import GrokSearchProvider
+import grok_search.providers.grok as grok_module
+from grok_search.providers.grok import GrokSearchProvider, _is_retryable_exception
 
 
 @pytest.mark.asyncio
@@ -129,6 +133,153 @@ async def test_streaming_parser_ignores_empty_and_usage_events():
     provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
 
     assert await provider._parse_streaming_response(StreamingResponse()) == "hello"
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_raises_for_upstream_error():
+    nested_marker = "PRIVATE_NESTED_ERROR_MARKER"
+    extra_marker = "PRIVATE_EXTRA_ERROR_MARKER"
+    payloads = (
+        (
+            {
+                "error": {
+                    "code": "upstream_stream_interrupted" + "x" * 500,
+                    "type": "server_error",
+                    "message": {"private": nested_marker},
+                    "debug": extra_marker,
+                }
+            },
+            "upstream_stream_interrupted",
+        ),
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": "response_failed" + "x" * 500,
+                        "type": "server_error",
+                        "message": "response failed",
+                        "details": {"private": nested_marker},
+                        "debug": extra_marker,
+                    },
+                },
+            },
+            "response_failed",
+        ),
+    )
+
+    class StreamingResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def aiter_lines(self):
+            if self.payload.get("type") == "response.failed":
+                yield "event: response.failed"
+            yield f"data: {json.dumps(self.payload)}"
+
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    for payload, expected_code in payloads:
+        with pytest.raises(RuntimeError) as exc_info:
+            await provider._parse_streaming_response(StreamingResponse(payload))
+
+        error_text = str(exc_info.value)
+        assert "Grok upstream stream error" in error_text
+        assert expected_code in error_text
+        assert nested_marker not in error_text
+        assert extra_marker not in error_text
+        assert len(error_text) <= 550
+
+
+@pytest.mark.asyncio
+async def test_streaming_parser_distinguishes_post_start_protocol_errors():
+    marker = "PRIVATE_TRANSPORT_MARKER"
+
+    class StreamingResponse:
+        def __init__(self, started):
+            self.started = started
+
+        async def aiter_lines(self):
+            if self.started:
+                yield 'data: {"choices": []}'
+            raise httpx.RemoteProtocolError(marker)
+
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    with pytest.raises(RuntimeError) as post_start:
+        await provider._parse_streaming_response(StreamingResponse(started=True))
+
+    error_text = str(post_start.value)
+    assert error_text.startswith("Grok upstream stream error:")
+    assert "code=upstream_stream_interrupted" in error_text
+    assert "type=transport_error" in error_text
+    assert marker not in error_text
+    assert not _is_retryable_exception(post_start.value)
+
+    with pytest.raises(httpx.RemoteProtocolError) as pre_start:
+        await provider._parse_streaming_response(StreamingResponse(started=False))
+
+    assert _is_retryable_exception(pre_start.value)
+
+
+@pytest.mark.asyncio
+async def test_grok_requests_fail_fast_while_another_stream_is_active(monkeypatch):
+    parser_started = asyncio.Event()
+    release_parser = asyncio.Event()
+    client_count = 0
+    stream_count = 0
+
+    class StreamingResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            parser_started.set()
+            await release_parser.wait()
+            yield 'data: {"choices": [{"delta": {"content": "hello"}}]}'
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            nonlocal client_count
+            client_count += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, *args, **kwargs):
+            nonlocal stream_count
+            stream_count += 1
+            return StreamingResponse()
+
+    monkeypatch.setattr(grok_module.httpx, "AsyncClient", FakeAsyncClient)
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    first = asyncio.create_task(provider._execute_stream_with_retry({}, {}))
+    await asyncio.wait_for(parser_started.wait(), timeout=1.0)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Grok request busy: another request is already in progress$",
+    ) as busy:
+        await asyncio.wait_for(provider._execute_stream_with_retry({}, {}), timeout=0.2)
+
+    assert not _is_retryable_exception(busy.value)
+    assert (client_count, stream_count) == (1, 1)
+
+    release_parser.set()
+    assert await first == "hello"
+    assert await provider._execute_stream_with_retry({}, {}) == "hello"
+    assert (client_count, stream_count) == (2, 2)
 
 
 @pytest.mark.asyncio
