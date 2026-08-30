@@ -6,7 +6,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 import grok_search.server as server
-from grok_search.providers.grok import GrokSearchProvider
+from grok_search.providers.grok import GrokSearchProvider, _is_retryable_exception
 
 
 @pytest.mark.asyncio
@@ -188,6 +188,37 @@ async def test_streaming_response_raises_for_upstream_error():
         assert nested_marker not in error_text
         assert extra_marker not in error_text
         assert len(error_text) <= 550
+
+
+@pytest.mark.asyncio
+async def test_streaming_parser_distinguishes_post_start_protocol_errors():
+    marker = "PRIVATE_TRANSPORT_MARKER"
+
+    class StreamingResponse:
+        def __init__(self, started):
+            self.started = started
+
+        async def aiter_lines(self):
+            if self.started:
+                yield 'data: {"choices": []}'
+            raise httpx.RemoteProtocolError(marker)
+
+    provider = GrokSearchProvider("https://grok.invalid", "test-grok-key", "test-model")
+
+    with pytest.raises(RuntimeError) as post_start:
+        await provider._parse_streaming_response(StreamingResponse(started=True))
+
+    error_text = str(post_start.value)
+    assert error_text.startswith("Grok upstream stream error:")
+    assert "code=upstream_stream_interrupted" in error_text
+    assert "type=transport_error" in error_text
+    assert marker not in error_text
+    assert not _is_retryable_exception(post_start.value)
+
+    with pytest.raises(httpx.RemoteProtocolError) as pre_start:
+        await provider._parse_streaming_response(StreamingResponse(started=False))
+
+    assert _is_retryable_exception(pre_start.value)
 
 
 @pytest.mark.asyncio

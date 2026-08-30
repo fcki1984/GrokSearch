@@ -179,51 +179,59 @@ class GrokSearchProvider(BaseSearchProvider):
         content = ""
         full_body_buffer = [] 
         
-        async for line in response.aiter_lines():
-            line = line.strip()
-            if not line:
-                continue
-            
-            full_body_buffer.append(line)
-
-            # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
-            if line.startswith("data:"):
-                if line in ("data: [DONE]", "data:[DONE]"):
+        try:
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
                     continue
-                try:
-                    # 去掉 "data:" 前缀，并去除可能的空格
-                    json_str = line[5:].lstrip()
-                    data = json.loads(json_str)
-                    error = data.get("error")
-                    is_response_failure = data.get("type") == "response.failed"
-                    if is_response_failure:
-                        response_data = data.get("response")
-                        error = response_data.get("error") if isinstance(response_data, dict) else None
-                    if error is not None or is_response_failure:
-                        def safe_detail(value):
-                            if not isinstance(value, (str, int, float, bool)):
-                                return ""
-                            return str(value).replace("\r", " ").replace("\n", " ")[:200]
 
-                        if isinstance(error, dict):
-                            parts = []
-                            for key in ("code", "type", "message"):
-                                value = safe_detail(error.get(key))
-                                if value:
-                                    parts.append(f"{key}={value}")
-                            details = ", ".join(parts)[:512]
-                        else:
-                            details = safe_detail(error)
-                        raise RuntimeError(
-                            f"Grok upstream stream error: {details or 'unknown error'}"
-                        )
-                    choices = data.get("choices", [])
-                    if choices and len(choices) > 0:
-                        delta = choices[0].get("delta", {})
-                        if "content" in delta:
-                            content += delta["content"]
-                except (json.JSONDecodeError, IndexError):
-                    continue
+                full_body_buffer.append(line)
+
+                # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
+                if line.startswith("data:"):
+                    if line in ("data: [DONE]", "data:[DONE]"):
+                        continue
+                    try:
+                        # 去掉 "data:" 前缀，并去除可能的空格
+                        json_str = line[5:].lstrip()
+                        data = json.loads(json_str)
+                        error = data.get("error")
+                        is_response_failure = data.get("type") == "response.failed"
+                        if is_response_failure:
+                            response_data = data.get("response")
+                            error = response_data.get("error") if isinstance(response_data, dict) else None
+                        if error is not None or is_response_failure:
+                            def safe_detail(value):
+                                if not isinstance(value, (str, int, float, bool)):
+                                    return ""
+                                return str(value).replace("\r", " ").replace("\n", " ")[:200]
+
+                            if isinstance(error, dict):
+                                parts = []
+                                for key in ("code", "type", "message"):
+                                    value = safe_detail(error.get(key))
+                                    if value:
+                                        parts.append(f"{key}={value}")
+                                details = ", ".join(parts)[:512]
+                            else:
+                                details = safe_detail(error)
+                            raise RuntimeError(
+                                f"Grok upstream stream error: {details or 'unknown error'}"
+                            )
+                        choices = data.get("choices", [])
+                        if choices and len(choices) > 0:
+                            delta = choices[0].get("delta", {})
+                            if "content" in delta:
+                                content += delta["content"]
+                    except (json.JSONDecodeError, IndexError):
+                        continue
+        except httpx.RemoteProtocolError:
+            if full_body_buffer:
+                raise RuntimeError(
+                    "Grok upstream stream error: code=upstream_stream_interrupted, "
+                    "type=transport_error, message=stream ended unexpectedly"
+                ) from None
+            raise
                 
         if not content and full_body_buffer:
             try:
