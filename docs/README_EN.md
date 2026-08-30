@@ -134,7 +134,7 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 ## 3. MCP Tools
 
 <details>
-<summary>This project provides eight MCP tools (click to expand)</summary>
+<summary>This project provides seven MCP tools (click to expand)</summary>
 
 ### `web_search` — AI Web Search
 
@@ -210,9 +210,9 @@ Settings persist to `~/.config/grok-search/config.json` across sessions.
 
 Modifies project-level `.claude/settings.json` `permissions.deny` to disable Claude Code's built-in WebSearch and WebFetch.
 
-### `search_planning` — Search Planning
+### Direct Search
 
-A structured multi-phase planning scaffold to generate an executable search plan before running complex searches.
+Call `web_search` directly. Pass `platform` to focus on specific sites, then use the returned `session_id` with `get_sources` when you need the source list.
 </details>
 
 ## 4. FAQ

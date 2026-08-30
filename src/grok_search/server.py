@@ -16,13 +16,11 @@ try:
     from grok_search.logger import log_info
     from grok_search.config import config
     from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
-    from grok_search.planning import engine as planning_engine, _split_csv
 except ImportError:
     from .providers.grok import GrokSearchProvider
     from .logger import log_info
     from .config import config
     from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
-    from .planning import engine as planning_engine, _split_csv
 
 import asyncio
 
@@ -115,7 +113,6 @@ def _extra_results_to_sources(
     name="web_search",
     output_schema=None,
     description="""
-    Before using this tool, please use the plan_intent tool to plan the search carefully.
     Performs a deep web search based on the given query and returns Grok's answer directly.
 
     This tool extracts sources if provided by upstream, caches them, and returns:
@@ -656,189 +653,6 @@ async def toggle_builtin_tools(
         "file": str(settings_path),
         "message": msg
     }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_intent",
-    output_schema=None,
-    description="""
-    Phase 1 of search planning: Analyze user intent. Call this FIRST to create a session.
-    Returns session_id for subsequent phases. Required flow:
-    plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution
-
-    Required phases depend on complexity: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.
-    """,
-)
-async def plan_intent(
-    thought: Annotated[str, "Reasoning for this phase"],
-    core_question: Annotated[str, "Distilled core question in one sentence"],
-    query_type: Annotated[str, "factual | comparative | exploratory | analytical"],
-    time_sensitivity: Annotated[str, "realtime | recent | historical | irrelevant"],
-    session_id: Annotated[str, "Empty for new session, or existing ID to revise"] = "",
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    domain: Annotated[str, "Specific domain if identifiable"] = "",
-    premise_valid: Annotated[Optional[bool], "False if the question contains a flawed assumption"] = None,
-    ambiguities: Annotated[str, "Comma-separated unresolved ambiguities"] = "",
-    unverified_terms: Annotated[str, "Comma-separated external terms to verify"] = "",
-    is_revision: Annotated[bool, "True to overwrite existing intent"] = False,
-) -> str:
-    import json
-    data = {"core_question": core_question, "query_type": query_type, "time_sensitivity": time_sensitivity}
-    if domain:
-        data["domain"] = domain
-    if premise_valid is not None:
-        data["premise_valid"] = premise_valid
-    if ambiguities:
-        data["ambiguities"] = _split_csv(ambiguities)
-    if unverified_terms:
-        data["unverified_terms"] = _split_csv(unverified_terms)
-    return json.dumps(planning_engine.process_phase(
-        phase="intent_analysis", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=data,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_complexity",
-    output_schema=None,
-    description="Phase 2: Assess search complexity (1-3). Controls required phases: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.",
-)
-async def plan_complexity(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for complexity assessment"],
-    level: Annotated[int, "Complexity 1-3"],
-    estimated_sub_queries: Annotated[int, "Expected number of sub-queries"],
-    estimated_tool_calls: Annotated[int, "Expected total tool calls"],
-    justification: Annotated[str, "Why this complexity level"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    is_revision: Annotated[bool, "True to overwrite"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    return json.dumps(planning_engine.process_phase(
-        phase="complexity_assessment", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence,
-        phase_data={"level": level, "estimated_sub_queries": estimated_sub_queries,
-                     "estimated_tool_calls": estimated_tool_calls, "justification": justification},
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_sub_query",
-    output_schema=None,
-    description="Phase 3: Add one sub-query. Call once per sub-query; data accumulates across calls. Set is_revision=true to replace all.",
-)
-async def plan_sub_query(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this sub-query"],
-    id: Annotated[str, "Unique ID (e.g., 'sq1')"],
-    goal: Annotated[str, "Sub-query goal"],
-    expected_output: Annotated[str, "What success looks like"],
-    boundary: Annotated[str, "What this excludes — mutual exclusion with siblings"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    depends_on: Annotated[str, "Comma-separated prerequisite IDs"] = "",
-    tool_hint: Annotated[str, "web_search | web_fetch | web_map"] = "",
-    is_revision: Annotated[bool, "True to replace all sub-queries"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    item = {"id": id, "goal": goal, "expected_output": expected_output, "boundary": boundary}
-    if depends_on:
-        item["depends_on"] = _split_csv(depends_on)
-    if tool_hint:
-        item["tool_hint"] = tool_hint
-    return json.dumps(planning_engine.process_phase(
-        phase="query_decomposition", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=item,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_search_term",
-    output_schema=None,
-    description="Phase 4: Add one search term. Call once per term; data accumulates. First call must set approach.",
-)
-async def plan_search_term(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this search term"],
-    term: Annotated[str, "Search query (max 8 words)"],
-    purpose: Annotated[str, "Sub-query ID this serves (e.g., 'sq1')"],
-    round: Annotated[int, "Execution round: 1=broad, 2+=targeted follow-up"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    approach: Annotated[str, "broad_first | narrow_first | targeted (required on first call)"] = "",
-    fallback_plan: Annotated[str, "Fallback if primary searches fail"] = "",
-    is_revision: Annotated[bool, "True to replace all search terms"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    data = {"search_terms": [{"term": term, "purpose": purpose, "round": round}]}
-    if approach:
-        data["approach"] = approach
-    if fallback_plan:
-        data["fallback_plan"] = fallback_plan
-    return json.dumps(planning_engine.process_phase(
-        phase="search_strategy", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=data,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_tool_mapping",
-    output_schema=None,
-    description="Phase 5: Map a sub-query to a tool. Call once per mapping; data accumulates.",
-)
-async def plan_tool_mapping(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this mapping"],
-    sub_query_id: Annotated[str, "Sub-query ID to map"],
-    tool: Annotated[str, "web_search | web_fetch | web_map"],
-    reason: Annotated[str, "Why this tool for this sub-query"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    params_json: Annotated[str, "Optional JSON string for tool-specific params"] = "",
-    is_revision: Annotated[bool, "True to replace all mappings"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    item = {"sub_query_id": sub_query_id, "tool": tool, "reason": reason}
-    if params_json:
-        try:
-            item["params"] = json.loads(params_json)
-        except json.JSONDecodeError:
-            pass
-    return json.dumps(planning_engine.process_phase(
-        phase="tool_selection", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=item,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_execution",
-    output_schema=None,
-    description="Phase 6: Define execution order. parallel_groups: semicolon-separated groups of comma-separated IDs (e.g., 'sq1,sq2;sq3').",
-)
-async def plan_execution(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for execution order"],
-    parallel_groups: Annotated[str, "Parallel batches: 'sq1,sq2;sq3,sq4' (semicolon=groups, comma=IDs)"],
-    sequential: Annotated[str, "Comma-separated IDs that must run in order"],
-    estimated_rounds: Annotated[int, "Estimated execution rounds"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    is_revision: Annotated[bool, "True to overwrite"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    parallel = [_split_csv(g) for g in parallel_groups.split(";") if g.strip()] if parallel_groups else []
-    seq = _split_csv(sequential)
-    return json.dumps(planning_engine.process_phase(
-        phase="execution_order", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence,
-        phase_data={"parallel": parallel, "sequential": seq, "estimated_rounds": estimated_rounds},
-    ), ensure_ascii=False, indent=2)
 
 
 def main():
