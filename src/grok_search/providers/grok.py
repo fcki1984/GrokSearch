@@ -1,4 +1,3 @@
-import asyncio
 import httpx
 import json
 from datetime import datetime, timezone
@@ -69,7 +68,6 @@ def _needs_time_context(query: str) -> bool:
     return False
 
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-_grok_request_lock = asyncio.Lock()
 
 
 def _is_retryable_exception(exc) -> bool:
@@ -151,11 +149,7 @@ class GrokSearchProvider(BaseSearchProvider):
             "stream": True,
         }
 
-        await log_info(
-            ctx,
-            f"search request: query_chars={len(query)}, platform_chars={len(platform_prompt)}",
-            config.debug_enabled,
-        )
+        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
@@ -181,59 +175,28 @@ class GrokSearchProvider(BaseSearchProvider):
         content = ""
         full_body_buffer = [] 
         
-        try:
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            
+            full_body_buffer.append(line)
+
+            # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
+            if line.startswith("data:"):
+                if line in ("data: [DONE]", "data:[DONE]"):
                     continue
-
-                full_body_buffer.append(line)
-
-                # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
-                if line.startswith("data:"):
-                    if line in ("data: [DONE]", "data:[DONE]"):
-                        continue
-                    try:
-                        # 去掉 "data:" 前缀，并去除可能的空格
-                        json_str = line[5:].lstrip()
-                        data = json.loads(json_str)
-                        error = data.get("error")
-                        is_response_failure = data.get("type") == "response.failed"
-                        if is_response_failure:
-                            response_data = data.get("response")
-                            error = response_data.get("error") if isinstance(response_data, dict) else None
-                        if error is not None or is_response_failure:
-                            def safe_detail(value):
-                                if not isinstance(value, (str, int, float, bool)):
-                                    return ""
-                                return str(value).replace("\r", " ").replace("\n", " ")[:200]
-
-                            if isinstance(error, dict):
-                                parts = []
-                                for key in ("code", "type", "message"):
-                                    value = safe_detail(error.get(key))
-                                    if value:
-                                        parts.append(f"{key}={value}")
-                                details = ", ".join(parts)[:512]
-                            else:
-                                details = safe_detail(error)
-                            raise RuntimeError(
-                                f"Grok upstream stream error: {details or 'unknown error'}"
-                            )
-                        choices = data.get("choices", [])
-                        if choices and len(choices) > 0:
-                            delta = choices[0].get("delta", {})
-                            if "content" in delta:
-                                content += delta["content"]
-                    except (json.JSONDecodeError, IndexError):
-                        continue
-        except httpx.RemoteProtocolError:
-            if full_body_buffer:
-                raise RuntimeError(
-                    "Grok upstream stream error: code=upstream_stream_interrupted, "
-                    "type=transport_error, message=stream ended unexpectedly"
-                ) from None
-            raise
+                try:
+                    # 去掉 "data:" 前缀，并去除可能的空格
+                    json_str = line[5:].lstrip()
+                    data = json.loads(json_str)
+                    choices = data.get("choices", [])
+                    if choices and len(choices) > 0:
+                        delta = choices[0].get("delta", {})
+                        if "content" in delta:
+                            content += delta["content"]
+                except (json.JSONDecodeError, IndexError):
+                    continue
                 
         if not content and full_body_buffer:
             try:
@@ -245,38 +208,30 @@ class GrokSearchProvider(BaseSearchProvider):
             except json.JSONDecodeError:
                 pass
         
-        await log_info(
-            ctx,
-            f"search response: content_chars={len(content)}",
-            config.debug_enabled,
-        )
+        await log_info(ctx, f"content: {content}", config.debug_enabled)
 
         return content
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的流式 HTTP 请求"""
-        if _grok_request_lock.locked():
-            raise RuntimeError("Grok request busy: another request is already in progress")
+        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
 
-        async with _grok_request_lock:
-            timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
-
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(config.retry_max_attempts + 1),
-                    wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                    retry=retry_if_exception(_is_retryable_exception),
-                    reraise=True,
-                ):
-                    with attempt:
-                        async with client.stream(
-                            "POST",
-                            f"{self.api_url}/chat/completions",
-                            headers=headers,
-                            json=payload,
-                        ) as response:
-                            response.raise_for_status()
-                            return await self._parse_streaming_response(response, ctx)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    async with client.stream(
+                        "POST",
+                        f"{self.api_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        return await self._parse_streaming_response(response, ctx)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
