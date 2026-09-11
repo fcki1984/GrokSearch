@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 - 2026-09-11 (task branch, unreleased; no tag)
+
+Runtime source patch artifact: `8673047f0d4ac83c13e94c920b3bb39ff8f1928e8d3c4aae3e6ed766cfa19340` (SHA-256).
+
+- `web_search` still requires Grok and preserves pre-provider validation errors. With `extra_sources > 0`, the existing allocation schedules only Tavily, only Firecrawl, or (when both are configured) Firecrawl with all quota and Tavily with zero.
+- When selected, Tavily Search now starts concurrently with the single Grok Search call. Nonblank Grok content wins; blank content, Grok's 30-second whole-operation deadline, and upstream HTTP/transport errors can use already-completed usable Tavily excerpts. Otherwise the call fails explicitly instead of succeeding with blank content.
+- Successful provider responses add `content_source` (`grok` or `tavily_search_fallback`) while retaining `session_id`, `content`, and `sources_count`. Fallback excerpts are labeled `Tavily search fallback` and `Untrusted search excerpts, not a Grok-generated answer`; sources remain available through `get_sources`.
+- Grok Search and Tavily Search/Extract/Map each have a 30-second whole-operation cap. `web_fetch` retains its Firecrawl fallback. `web_map` still accepts `timeout` 10-150 with default 150, while its effective Tavily cap is `min(timeout, 30)`.
+- Known limitations: these operation caps are product budgets, not end-to-end SLAs. Optional uncached model validation can add time, Firecrawl retains independent timing, and both-provider allocation may wait for Firecrawl. There is no Grok retry, second Tavily request, automatic Extract fallback for search, or provider reallocation. The quick smoke does not prove load/concurrency, production reliability/SLA, all upstream failures, or the Grok2API root cause; reported 30/60 timing remains a user observation, not an SLA.
+- Verified locally with Python 3.12.4: focused fallback/deadline/cancellation/allocation regressions and the complete discovered suite each passed 30/30 with exit 0 and no warnings; source/tests compilation passed, including a repeat after the final test-only edit. Real FastMCP initialize/list_tools returned exactly the seven existing names; after normalizing only the planned `web_search.description` change, the comparison-contract SHA-256 remained `9baa229f6fe112eaaca2d808674f5e906fcf524c84af5400f1dbd859edb56c00`, and the `web_search` inputSchema SHA-256 remained `ccfd7e0f883dde805f6de9e21849577ddb0dee1a5d4a1e0f2c714efb2e2f3966`. `git diff --check`, version `0.2.1` parsing, unchanged dependencies, approved changed-file scope, and credential/private-host scanning passed. These local checks used no network or live provider.
+- On 2026-09-12, an authorized target quick smoke passed both named scenarios through a real FastMCP Client. The normal path completed in 8.668 seconds with `content_source=grok` and one source; the controlled fallback completed in 4.493 seconds with `content_source=tavily_search_fallback`, one source, and both required fallback labels. Corrected sanitized artifact SHA-256: `fb9605665e9aa8e20283402ba5c27ee66120670745d969cb46343ec27cf0c7bb`. This is not load/concurrency, production reliability/SLA, exhaustive upstream-failure, or root-cause proof.
+
 ## 0.2.0 - 2026-08-30 (task branch, unreleased; no tag)
 
 Runtime patch artifact: `17c24700e30c440bf1ed7b6ff4324385d650e032d32aff0dfd265960630b80c3` (SHA-256).

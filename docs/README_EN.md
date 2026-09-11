@@ -138,9 +138,13 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 
 ### `web_search` — AI Web Search
 
-Executes AI-driven web search via Grok API. By default it returns only Grok's answer and a `session_id` for retrieving sources later.
+Executes AI-driven web search via Grok API. Grok remains required, and local configuration and model validation run before provider requests.
 
-`web_search` does not expand sources in the response; it only returns `sources_count`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
+`web_search` does not expand sources inline. A successful structured response returns `session_id`, `content`, `sources_count`, and `content_source`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
+
+When `extra_sources > 0`, only the provider selected by the existing allocation is scheduled: Tavily gets the quota when only Tavily is configured, Firecrawl gets it when only Firecrawl is configured, and Firecrawl gets all of it (Tavily gets zero) when both are configured. When Tavily is selected, Tavily Search starts concurrently with the single Grok Search call; it does not wait for Grok to fail.
+
+A nonblank Grok answer always wins. If Grok returns blank, reaches its own 30-second whole-operation cap, or has an upstream HTTP/transport error, `web_search` uses usable Tavily Search excerpts already completed by the concurrent request. Fallback content is explicitly labeled `Tavily search fallback` and `Untrusted search excerpts, not a Grok-generated answer`; it is not Grok-generated or synthesized. Sources remain available through `get_sources`. If Tavily was not selected or has no usable results, the tool fails explicitly instead of returning successful blank content.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -153,8 +157,11 @@ Automatically detects time-related keywords in queries (e.g., "latest", "today",
 
 Return value (structured dict):
 - `session_id`: search session ID
-- `content`: answer only (sources removed)
+- `content`: Grok answer or labeled Tavily Search fallback excerpts
 - `sources_count`: cached sources count
+- `content_source`: exactly `grok` or `tavily_search_fallback`
+
+These fields describe successful provider responses. Pre-provider configuration and model-validation errors keep their existing error-object behavior. Grok Search and Tavily Search each have a 30-second whole-operation cap, not an end-to-end `web_search` SLA: optional uncached model validation can add time, Firecrawl keeps its independent timing, and the both-configured allocation may wait for Firecrawl. This path does not retry Grok, issue a second Tavily request, automatically call Tavily Extract, or reallocate providers.
 
 ### `get_sources` — Retrieve Sources
 
@@ -171,7 +178,7 @@ Return value (structured dict):
 
 ### `web_fetch` — Web Content Extraction
 
-Extracts complete web content via Tavily Extract API, returning Markdown format.
+Extracts complete web content via Tavily Extract API, returning Markdown format. Tavily Extract has a 30-second whole-operation cap; after a failure, the existing Firecrawl Scrape fallback remains and uses its independent timing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -189,6 +196,8 @@ Traverses website structure via Tavily Map API, discovering URLs and generating 
 | `max_breadth` | int | No | `20` | Max links to follow per page (1-500) |
 | `limit` | int | No | `50` | Total link processing limit (1-500) |
 | `timeout` | int | No | `150` | Timeout in seconds (10-150) |
+
+The public `timeout` default and accepted range remain 150 seconds and 10-150 seconds. Tavily Map's effective whole-operation cap is `min(timeout, 30)` seconds.
 
 ### `get_config_info` — Configuration Diagnostics
 
@@ -221,7 +230,7 @@ Call `web_search` directly. Pass `platform` to focus on specific sites, then use
 <summary>
 Q: Must I configure both Grok and Tavily?
 </summary>
-A: Grok (`GROK_API_URL` + `GROK_API_KEY`) is required and provides the core search capability. Tavily is optional — without it, `web_fetch` and `web_map` will return configuration error messages. Firecrawl can be configured as an optional fallback.
+A: Grok (`GROK_API_URL` + `GROK_API_KEY`) remains required for `web_search`. Tavily and Firecrawl are optional. With `extra_sources > 0`, only one provider is selected by the existing allocation; configuring both gives all quota to Firecrawl, so Tavily Search fallback is not enabled. `web_fetch` prefers Tavily Extract and can fall back to Firecrawl Scrape; without either provider it returns a configuration error. `web_map` requires Tavily.
 </details>
 
 <details>
