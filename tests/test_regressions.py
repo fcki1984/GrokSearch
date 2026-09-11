@@ -589,6 +589,28 @@ async def test_tavily_map_timeout_reports_effective_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_raises_tool_error_when_all_configured_extractors_fail(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "test-firecrawl-key")
+    calls = []
+
+    async def tavily_extract(url):
+        calls.append("tavily")
+        return None
+
+    async def firecrawl_scrape(url, ctx=None):
+        calls.append("firecrawl")
+        return None
+
+    monkeypatch.setattr(server, "_call_tavily_extract", tavily_extract)
+    monkeypatch.setattr(server, "_call_firecrawl_scrape", firecrawl_scrape)
+
+    with pytest.raises(ToolError, match="提取失败: 所有提取服务均未能获取内容"):
+        await server.web_fetch("https://example.invalid")
+    assert calls == ["tavily", "firecrawl"]
+
+
+@pytest.mark.asyncio
 async def test_tavily_disabled_blocks_all_tavily_requests(monkeypatch):
     monkeypatch.setenv("GROK_API_URL", "https://grok.invalid")
     monkeypatch.setenv("GROK_API_KEY", "test-grok-key")

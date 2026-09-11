@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-09-12 (task branch, unreleased; no tag)
+
+- `web_fetch` now returns an MCP tool error, rather than successful failure text, when all configured extraction services provide no usable content.
+- This change does not identify 404 separately because the current extraction helpers do not retain a provider-specific failure reason.
+- Verification: focused regression 1/1, full suite 34/34, and source compilation passed.
+
 ## 0.2.1 - 2026-09-11 (task branch, unreleased; no tag)
 
 Implementation base commit: `7aa972843dad643da059c02819b61aefcd85527f`; current `server.py` SHA-256: `58d23341c4a09a5617782d4d94d6e5a43182ad7fc0a2ea06b1b5ba6a7e30a1c4` (unreleased; no tag).
