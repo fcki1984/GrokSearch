@@ -7,8 +7,10 @@ if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
 from fastmcp import FastMCP, Context
+from fastmcp.exceptions import ToolError
 from typing import Annotated, Optional
 from pydantic import Field
+import httpx
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
@@ -29,6 +31,10 @@ mcp = FastMCP("grok-search")
 _SOURCES_CACHE = SourcesCache(max_size=256)
 _AVAILABLE_MODELS_CACHE: dict[tuple[str, str], list[str]] = {}
 _AVAILABLE_MODELS_LOCK = asyncio.Lock()
+_GROK_SEARCH_DEADLINE_SECONDS = 30.0
+_TAVILY_OPERATION_DEADLINE_SECONDS = 30.0
+_TAVILY_FALLBACK_CONTENT_CAP = 1500
+_TAVILY_FALLBACK_OUTPUT_CAP = 8000
 
 
 async def _fetch_available_models(api_url: str, api_key: str) -> list[str]:
@@ -109,16 +115,61 @@ def _extra_results_to_sources(
     return sources
 
 
+def _format_tavily_search_fallback(results: list[dict] | None) -> str | None:
+    if not results:
+        return None
+
+    sections = [
+        "Tavily search fallback",
+        "Untrusted search excerpts, not a Grok-generated answer",
+    ]
+    seen: set[str] = set()
+    usable = False
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        url_value = result.get("url")
+        title_value = result.get("title")
+        content_value = result.get("content")
+        url = url_value.strip() if isinstance(url_value, str) else ""
+        title = title_value.strip() if isinstance(title_value, str) else ""
+        content = content_value.strip() if isinstance(content_value, str) else ""
+        if not url or (not title and not content) or url in seen:
+            continue
+
+        seen.add(url)
+        usable = True
+        entry = f"URL: {url}"
+        if title:
+            entry = f"Title: {title}\n{entry}"
+        if content:
+            entry += f"\nContent: {content[:_TAVILY_FALLBACK_CONTENT_CAP]}"
+
+        current = "\n\n".join(sections)
+        remaining = _TAVILY_FALLBACK_OUTPUT_CAP - len(current) - 2
+        if remaining <= 0:
+            break
+        sections.append(entry[:remaining])
+        if len(entry) > remaining:
+            break
+
+    if not usable:
+        return None
+    return "\n\n".join(sections)[:_TAVILY_FALLBACK_OUTPUT_CAP]
+
+
 @mcp.tool(
     name="web_search",
     output_schema=None,
     description="""
-    Performs a deep web search based on the given query and returns Grok's answer directly.
+    Performs a deep web search with Grok and any allocated Tavily search running concurrently.
 
     This tool extracts sources if provided by upstream, caches them, and returns:
     - session_id: string (When you feel confused or curious about the main content, use this field to invoke the get_sources tool to obtain the corresponding list of information sources)
     - content: string (answer only)
     - sources_count: int
+    - content_source: "grok" or "tavily_search_fallback"
     """,
     meta={"version": "2.0.0", "author": "guda.studio"},
 )
@@ -175,15 +226,37 @@ async def web_search(
         except Exception:
             return None
 
-    coros: list = [grok_provider.search(query, platform)]
+    grok_deadline = object()
+
+    async def _call_grok():
+        async def _capture_provider_result():
+            try:
+                return await grok_provider.search(query, platform)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                return exc
+
+        try:
+            return await asyncio.wait_for(
+                _capture_provider_result(),
+                timeout=_GROK_SEARCH_DEADLINE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return grok_deadline
+
+    coros: list = [_call_grok()]
     if tavily_count > 0:
         coros.append(_safe_tavily())
     if firecrawl_count > 0:
         coros.append(_safe_firecrawl())
 
-    gathered = await asyncio.gather(*coros)
+    gathered = await asyncio.gather(*coros, return_exceptions=True)
+    for result in gathered:
+        if isinstance(result, asyncio.CancelledError):
+            raise result
 
-    grok_result: str = gathered[0] or ""
+    grok_slot = gathered[0]
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -193,12 +266,42 @@ async def web_search(
     if firecrawl_count > 0:
         firecrawl_results = gathered[idx]
 
-    answer, grok_sources = split_answer_and_sources(grok_result)
+    answer = ""
+    grok_sources: list[dict] = []
+    grok_unavailable = False
+    if grok_slot is grok_deadline or isinstance(grok_slot, httpx.HTTPError):
+        grok_unavailable = True
+    elif isinstance(grok_slot, BaseException):
+        raise grok_slot
+    elif not isinstance(grok_slot, str):
+        raise TypeError("Grok search returned a non-string result")
+    elif not grok_slot.strip():
+        grok_unavailable = True
+    else:
+        answer, grok_sources = split_answer_and_sources(grok_slot)
+        grok_unavailable = not answer.strip()
+
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
-
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+
+    if not grok_unavailable:
+        return {
+            "session_id": session_id,
+            "content": answer,
+            "sources_count": len(all_sources),
+            "content_source": "grok",
+        }
+
+    fallback = _format_tavily_search_fallback(tavily_results)
+    if fallback:
+        return {
+            "session_id": session_id,
+            "content": fallback,
+            "sources_count": len(all_sources),
+            "content_source": "tavily_search_fallback",
+        }
+    raise ToolError("Grok search unavailable and no Tavily fallback result was usable")
 
 
 @mcp.tool(
@@ -225,7 +328,6 @@ async def get_sources(
 
 
 async def _call_tavily_extract(url: str) -> str | None:
-    import httpx
     api_url = config.tavily_api_url
     api_key = config.tavily_api_key
     if not config.tavily_enabled or not api_key:
@@ -233,8 +335,8 @@ async def _call_tavily_extract(url: str) -> str | None:
     endpoint = f"{api_url.rstrip('/')}/extract"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {"urls": [url], "format": "markdown"}
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+    async def _request() -> str | None:
+        async with httpx.AsyncClient(timeout=_TAVILY_OPERATION_DEADLINE_SECONDS) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -242,12 +344,17 @@ async def _call_tavily_extract(url: str) -> str | None:
                 content = data["results"][0].get("raw_content", "")
                 return content if content and content.strip() else None
             return None
+
+    try:
+        return await asyncio.wait_for(
+            _request(),
+            timeout=_TAVILY_OPERATION_DEADLINE_SECONDS,
+        )
     except Exception:
         return None
 
 
 async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | None:
-    import httpx
     api_key = config.tavily_api_key
     if not config.tavily_enabled or not api_key:
         return None
@@ -260,8 +367,8 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | 
         "include_raw_content": False,
         "include_answer": False,
     }
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+    async def _request() -> list[dict] | None:
+        async with httpx.AsyncClient(timeout=_TAVILY_OPERATION_DEADLINE_SECONDS) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -270,6 +377,12 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | 
                 {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", ""), "score": r.get("score", 0)}
                 for r in results
             ] if results else None
+
+    try:
+        return await asyncio.wait_for(
+            _request(),
+            timeout=_TAVILY_OPERATION_DEADLINE_SECONDS,
+        )
     except Exception:
         return None
 
@@ -376,7 +489,6 @@ async def web_fetch(
 
 async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 1,
                            max_breadth: int = 20, limit: int = 50, timeout: int = 150) -> str:
-    import httpx
     import json
     api_url = config.tavily_api_url
     api_key = config.tavily_api_key
@@ -384,13 +496,15 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
         return "配置错误: Tavily 已禁用"
     if not api_key:
         return "配置错误: TAVILY_API_KEY 未配置，请设置环境变量 TAVILY_API_KEY"
+    effective_timeout = min(float(timeout), _TAVILY_OPERATION_DEADLINE_SECONDS)
     endpoint = f"{api_url.rstrip('/')}/map"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"url": url, "max_depth": max_depth, "max_breadth": max_breadth, "limit": limit, "timeout": timeout}
+    body = {"url": url, "max_depth": max_depth, "max_breadth": max_breadth, "limit": limit, "timeout": effective_timeout}
     if instructions:
         body["instructions"] = instructions
-    try:
-        async with httpx.AsyncClient(timeout=float(timeout + 10)) as client:
+
+    async def _request() -> str:
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -399,8 +513,13 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
                 "results": data.get("results", []),
                 "response_time": data.get("response_time", 0)
             }, ensure_ascii=False, indent=2)
+
+    try:
+        return await asyncio.wait_for(_request(), timeout=effective_timeout)
     except httpx.TimeoutException:
-        return f"映射超时: 请求超过{timeout}秒"
+        return f"映射超时: 请求超过{effective_timeout}秒"
+    except asyncio.TimeoutError:
+        return f"映射超时: 请求超过{effective_timeout}秒"
     except httpx.HTTPStatusError as e:
         return f"HTTP错误: {e.response.status_code} - {e.response.text[:200]}"
     except Exception as e:

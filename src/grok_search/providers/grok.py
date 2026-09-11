@@ -151,7 +151,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_stream_with_retry(headers, payload, ctx, total_attempts=1)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -212,13 +212,22 @@ class GrokSearchProvider(BaseSearchProvider):
 
         return content
 
-    async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+    async def _execute_stream_with_retry(
+        self,
+        headers: dict,
+        payload: dict,
+        ctx=None,
+        total_attempts: int | None = None,
+    ) -> str:
         """执行带重试机制的流式 HTTP 请求"""
         timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+        if total_attempts is not None and total_attempts < 1:
+            raise ValueError("total_attempts must be at least 1")
+        attempts = total_attempts if total_attempts is not None else config.retry_max_attempts + 1
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                stop=stop_after_attempt(attempts),
                 wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
                 retry=retry_if_exception(_is_retryable_exception),
                 reraise=True,

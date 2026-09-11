@@ -160,9 +160,13 @@ claude mcp list
 
 ### `web_search` — AI 网络搜索
 
-通过 Grok API 执行 AI 驱动的网络搜索，默认仅返回 Grok 的回答正文，并返回 `session_id` 以便后续获取信源。
+通过 Grok API 执行 AI 驱动的网络搜索。该工具仍要求配置 Grok，并会先完成本地配置和模型校验。
 
-`web_search` 输出不展开信源，仅返回 `sources_count`；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
+`web_search` 不在响应内展开信源；成功的结构化响应返回 `session_id`、`content`、`sources_count` 和 `content_source`。信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
+
+当 `extra_sources > 0` 时，只调度现有分配规则选中的额外信源提供方：仅配置 Tavily 时配额给 Tavily，仅配置 Firecrawl 时配额给 Firecrawl；两者都配置时全部配额给 Firecrawl，Tavily 配额为零。当 Tavily 被选中时，Tavily Search 与唯一一次 Grok Search 并发启动，而不是等待 Grok 失败后再调用。
+
+非空 Grok 回答始终优先。若 Grok 返回空白、达到自身 30 秒完整操作上限，或发生上游 HTTP/传输错误，工具会使用并发请求中已完成且可用的 Tavily Search 摘录。回退正文会明确标注 `Tavily search fallback` 和 `Untrusted search excerpts, not a Grok-generated answer`，它不是 Grok 生成或综合的回答；信源仍可通过 `get_sources` 获取。若未选中 Tavily 或没有可用结果，工具会明确失败，不会成功返回空白正文。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -175,8 +179,11 @@ claude mcp list
 
 返回值（结构化字典）：
 - `session_id`: 本次查询的会话 ID
-- `content`: Grok 回答正文（已自动剥离信源）
+- `content`: Grok 回答正文或已标注的 Tavily Search 回退摘录
 - `sources_count`: 已缓存的信源数量
+- `content_source`: 正文来源，值严格为 `grok` 或 `tavily_search_fallback`
+
+以上字段适用于提供方请求成功的响应；请求提供方前的配置或模型校验错误仍按原有错误对象返回。Grok Search 和 Tavily Search 均有 30 秒完整操作上限，但这不是 `web_search` 端到端 SLA：可选的未缓存模型校验可能增加耗时，Firecrawl 使用既有独立时序，两者均配置时现有分配还可能等待 Firecrawl。该路径不重试 Grok，不发起第二次 Tavily 请求，不自动调用 Tavily Extract，也不重新分配提供方。
 
 ### `get_sources` — 获取信源
 
@@ -193,7 +200,7 @@ claude mcp list
 
 ### `web_fetch` — 网页内容抓取
 
-通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily 失败时自动降级到 Firecrawl Scrape 进行托底抓取。
+通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily Extract 的完整操作上限为 30 秒；失败后仍按原有行为降级到 Firecrawl Scrape，Firecrawl 使用其独立时序。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -211,6 +218,8 @@ claude mcp list
 | `max_breadth` | int | ❌ | `20` | 每页最大跟踪链接数（1-500） |
 | `limit` | int | ❌ | `50` | 总链接处理数上限（1-500） |
 | `timeout` | int | ❌ | `150` | 超时秒数（10-150） |
+
+`timeout` 的公开默认值和可接受范围仍为 150 秒及 10-150 秒；Tavily Map 的实际完整操作上限为 `min(timeout, 30)` 秒。
 
 ### `get_config_info` — 配置诊断
 
@@ -243,7 +252,7 @@ claude mcp list
 <summary>
 Q: 必须同时配置 Grok 和 Tavily 吗？
 </summary>
-A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；两者均未配置时 `web_fetch` 将返回配置错误提示。`web_map` 依赖 Tavily。
+A: Grok（`GROK_API_URL` + `GROK_API_KEY`）仍为 `web_search` 必填项。Tavily 和 Firecrawl 均为可选；`extra_sources > 0` 时只使用现有规则选中的一个提供方，两者都配置会把全部配额分给 Firecrawl，因此不会启用 Tavily Search 回退。`web_fetch` 优先使用 Tavily Extract，失败时可降级到 Firecrawl Scrape；两者均未配置时返回配置错误。`web_map` 依赖 Tavily。
 </details>
 
 <details>
