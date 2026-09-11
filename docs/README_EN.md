@@ -142,16 +142,16 @@ Executes AI-driven web search via Grok API. Grok remains required, and local con
 
 `web_search` does not expand sources inline. A successful structured response returns `session_id`, `content`, `sources_count`, and `content_source`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
 
-When `extra_sources > 0`, only the provider selected by the existing allocation is scheduled: Tavily gets the quota when only Tavily is configured, Firecrawl gets it when only Firecrawl is configured, and Firecrawl gets all of it (Tavily gets zero) when both are configured. When Tavily is selected, Tavily Search starts concurrently with the single Grok Search call; it does not wait for Grok to fail.
+When Tavily is enabled and has an API key, every locally validated request starts one standby Tavily Search concurrently with the single Grok Search call; it does not wait for Grok to fail. Its `max_results` is at least 5 and increases when `extra_sources` requests a larger quota. `extra_sources` still controls only the Tavily/Firecrawl supplementary sources exposed and cached when Grok succeeds, plus the existing Firecrawl allocation.
 
-A nonblank Grok answer always wins. If Grok returns blank, reaches its own 30-second whole-operation cap, or has an upstream HTTP/transport error, `web_search` uses usable Tavily Search excerpts already completed by the concurrent request. Fallback content is explicitly labeled `Tavily search fallback` and `Untrusted search excerpts, not a Grok-generated answer`; it is not Grok-generated or synthesized. Sources remain available through `get_sources`. If Tavily was not selected or has no usable results, the tool fails explicitly instead of returning successful blank content.
+A nonblank Grok answer always wins. If Grok returns blank, reaches its own 30-second whole-operation cap, or has an upstream HTTP/transport error, `web_search` uses the complete usable standby Tavily Search results already completed by the concurrent request. Fallback content is explicitly labeled `Tavily search fallback` and `Untrusted search excerpts, not a Grok-generated answer`; it is not Grok-generated or synthesized. `sources_count` and `get_sources` still reflect only supplementary sources selected by the `extra_sources` quota, so standby results are not exposed or cached when `extra_sources=0`. If Tavily is disabled, unconfigured, or has no usable results, the tool fails explicitly instead of returning successful blank content.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Search query |
 | `platform` | string | No | `""` | Focus platform (e.g., `"Twitter"`, `"GitHub, Reddit"`) |
 | `model` | string | No | `null` | Per-request Grok model ID |
-| `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0 disables) |
+| `extra_sources` | int | No | `0` | Tavily/Firecrawl supplementary sources exposed and cached when Grok succeeds; `0` does not disable configured Tavily standby |
 
 Automatically detects time-related keywords in queries (e.g., "latest", "today", "recent"), injecting local time context to improve accuracy for time-sensitive searches.
 
@@ -161,7 +161,7 @@ Return value (structured dict):
 - `sources_count`: cached sources count
 - `content_source`: exactly `grok` or `tavily_search_fallback`
 
-These fields describe successful provider responses. Pre-provider configuration and model-validation errors keep their existing error-object behavior. Grok Search and Tavily Search each have a 30-second whole-operation cap, not an end-to-end `web_search` SLA: optional uncached model validation can add time, Firecrawl keeps its independent timing, and the both-configured allocation may wait for Firecrawl. This path does not retry Grok, issue a second Tavily request, automatically call Tavily Extract, or reallocate providers.
+These fields describe successful provider responses. Pre-provider configuration and model-validation errors keep their existing error-object behavior. Grok Search and Tavily Search each have a 30-second whole-operation cap, not an end-to-end `web_search` SLA: optional uncached model validation can add time, Firecrawl keeps its independent timing, and the both-configured allocation may wait for Firecrawl. This path does not retry Grok, issues at most one Tavily Search per request, does not automatically call Tavily Extract, and does not reallocate supplementary-source quota.
 
 ### `get_sources` — Retrieve Sources
 
@@ -230,7 +230,7 @@ Call `web_search` directly. Pass `platform` to focus on specific sites, then use
 <summary>
 Q: Must I configure both Grok and Tavily?
 </summary>
-A: Grok (`GROK_API_URL` + `GROK_API_KEY`) remains required for `web_search`. Tavily and Firecrawl are optional. With `extra_sources > 0`, only one provider is selected by the existing allocation; configuring both gives all quota to Firecrawl, so Tavily Search fallback is not enabled. `web_fetch` prefers Tavily Extract and can fall back to Firecrawl Scrape; without either provider it returns a configuration error. `web_map` requires Tavily.
+A: Grok (`GROK_API_URL` + `GROK_API_KEY`) remains required for `web_search`. Tavily and Firecrawl are optional. When Tavily is enabled and configured, every locally validated `web_search` starts one standby Search. `extra_sources` controls only supplementary sources exposed and cached on the Grok-success path plus Firecrawl allocation; configuring both still gives all supplementary quota to Firecrawl, while Tavily standby fallback remains available. `web_fetch` prefers Tavily Extract and can fall back to Firecrawl Scrape; without either provider it returns a configuration error. `web_map` requires Tavily.
 </details>
 
 <details>

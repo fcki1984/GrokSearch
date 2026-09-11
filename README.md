@@ -164,16 +164,16 @@ claude mcp list
 
 `web_search` 不在响应内展开信源；成功的结构化响应返回 `session_id`、`content`、`sources_count` 和 `content_source`。信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
 
-当 `extra_sources > 0` 时，只调度现有分配规则选中的额外信源提供方：仅配置 Tavily 时配额给 Tavily，仅配置 Firecrawl 时配额给 Firecrawl；两者都配置时全部配额给 Firecrawl，Tavily 配额为零。当 Tavily 被选中时，Tavily Search 与唯一一次 Grok Search 并发启动，而不是等待 Grok 失败后再调用。
+当 Tavily 已启用并配置 API key 时，每个通过本地校验的请求都会把一次 Tavily Search 作为备用，与唯一一次 Grok Search 并发启动，而不是等待 Grok 失败后再调用。该请求的 `max_results` 至少为 5；`extra_sources` 配额更大时会请求更多候选。`extra_sources` 仍只控制 Grok 成功路径公开和缓存的 Tavily/Firecrawl 补充信源，以及既有 Firecrawl 分配。
 
-非空 Grok 回答始终优先。若 Grok 返回空白、达到自身 30 秒完整操作上限，或发生上游 HTTP/传输错误，工具会使用并发请求中已完成且可用的 Tavily Search 摘录。回退正文会明确标注 `Tavily search fallback` 和 `Untrusted search excerpts, not a Grok-generated answer`，它不是 Grok 生成或综合的回答；信源仍可通过 `get_sources` 获取。若未选中 Tavily 或没有可用结果，工具会明确失败，不会成功返回空白正文。
+非空 Grok 回答始终优先。若 Grok 返回空白、达到自身 30 秒完整操作上限，或发生上游 HTTP/传输错误，工具会使用并发请求中已完成且可用的完整 Tavily Search 备用结果。回退正文会明确标注 `Tavily search fallback` 和 `Untrusted search excerpts, not a Grok-generated answer`，它不是 Grok 生成或综合的回答。`sources_count` 和 `get_sources` 仍只反映 `extra_sources` 配额选中的补充信源；`extra_sources=0` 时备用结果不会公开或缓存。若 Tavily 未启用、未配置或没有可用结果，工具会明确失败，不会成功返回空白正文。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `query` | string | ✅ | - | 搜索查询语句 |
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
 | `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
-| `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
+| `extra_sources` | int | ❌ | `0` | Grok 成功路径公开和缓存的 Tavily/Firecrawl 补充信源数量；`0` 不关闭已配置的 Tavily 备用请求 |
 
 自动检测查询中的时间相关关键词（如"最新""今天""recent"等），注入本地时间上下文以提升时效性搜索的准确度。
 
@@ -183,7 +183,7 @@ claude mcp list
 - `sources_count`: 已缓存的信源数量
 - `content_source`: 正文来源，值严格为 `grok` 或 `tavily_search_fallback`
 
-以上字段适用于提供方请求成功的响应；请求提供方前的配置或模型校验错误仍按原有错误对象返回。Grok Search 和 Tavily Search 均有 30 秒完整操作上限，但这不是 `web_search` 端到端 SLA：可选的未缓存模型校验可能增加耗时，Firecrawl 使用既有独立时序，两者均配置时现有分配还可能等待 Firecrawl。该路径不重试 Grok，不发起第二次 Tavily 请求，不自动调用 Tavily Extract，也不重新分配提供方。
+以上字段适用于提供方请求成功的响应；请求提供方前的配置或模型校验错误仍按原有错误对象返回。Grok Search 和 Tavily Search 均有 30 秒完整操作上限，但这不是 `web_search` 端到端 SLA：可选的未缓存模型校验可能增加耗时，Firecrawl 使用既有独立时序，两者均配置时现有分配还可能等待 Firecrawl。该路径不重试 Grok，每次最多发起一次 Tavily Search，不自动调用 Tavily Extract，也不重新分配补充信源配额。
 
 ### `get_sources` — 获取信源
 
@@ -252,7 +252,7 @@ claude mcp list
 <summary>
 Q: 必须同时配置 Grok 和 Tavily 吗？
 </summary>
-A: Grok（`GROK_API_URL` + `GROK_API_KEY`）仍为 `web_search` 必填项。Tavily 和 Firecrawl 均为可选；`extra_sources > 0` 时只使用现有规则选中的一个提供方，两者都配置会把全部配额分给 Firecrawl，因此不会启用 Tavily Search 回退。`web_fetch` 优先使用 Tavily Extract，失败时可降级到 Firecrawl Scrape；两者均未配置时返回配置错误。`web_map` 依赖 Tavily。
+A: Grok（`GROK_API_URL` + `GROK_API_KEY`）仍为 `web_search` 必填项。Tavily 和 Firecrawl 均为可选；Tavily 启用并配置后，每个通过本地校验的 `web_search` 都会并发发起一次备用 Search。`extra_sources` 只控制 Grok 成功路径公开和缓存的补充信源及 Firecrawl 分配；两者都配置时补充配额仍全部分给 Firecrawl，但 Tavily 备用回退仍可用。`web_fetch` 优先使用 Tavily Extract，失败时可降级到 Firecrawl Scrape；两者均未配置时返回配置错误。`web_map` 依赖 Tavily。
 </details>
 
 <details>

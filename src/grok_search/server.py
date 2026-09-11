@@ -33,6 +33,7 @@ _AVAILABLE_MODELS_CACHE: dict[tuple[str, str], list[str]] = {}
 _AVAILABLE_MODELS_LOCK = asyncio.Lock()
 _GROK_SEARCH_DEADLINE_SECONDS = 30.0
 _TAVILY_OPERATION_DEADLINE_SECONDS = 30.0
+_TAVILY_FALLBACK_MIN_RESULTS = 5
 _TAVILY_FALLBACK_CONTENT_CAP = 1500
 _TAVILY_FALLBACK_OUTPUT_CAP = 8000
 
@@ -177,7 +178,7 @@ async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
-    extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 0."] = 0,
+    extra_sources: Annotated[int, "Number of Tavily/Firecrawl supplementary sources. Set 0 to disable supplementary sources, not configured Tavily standby. Default 0."] = 0,
 ) -> dict:
     session_id = new_session_id()
     try:
@@ -210,12 +211,13 @@ async def web_search(
             firecrawl_count = extra_sources
         elif has_tavily:
             tavily_count = extra_sources
+    tavily_request_count = max(_TAVILY_FALLBACK_MIN_RESULTS, tavily_count) if has_tavily else 0
 
     # 并行执行搜索任务
     async def _safe_tavily() -> list[dict] | None:
         try:
-            if tavily_count:
-                return await _call_tavily_search(query, tavily_count)
+            if tavily_request_count:
+                return await _call_tavily_search(query, tavily_request_count)
         except Exception:
             return None
 
@@ -246,7 +248,7 @@ async def web_search(
             return grok_deadline
 
     coros: list = [_call_grok()]
-    if tavily_count > 0:
+    if tavily_request_count > 0:
         coros.append(_safe_tavily())
     if firecrawl_count > 0:
         coros.append(_safe_firecrawl())
@@ -260,7 +262,7 @@ async def web_search(
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
-    if tavily_count > 0:
+    if tavily_request_count > 0:
         tavily_results = gathered[idx]
         idx += 1
     if firecrawl_count > 0:
@@ -281,7 +283,8 @@ async def web_search(
         answer, grok_sources = split_answer_and_sources(grok_slot)
         grok_unavailable = not answer.strip()
 
-    extra = _extra_results_to_sources(tavily_results, firecrawl_results)
+    selected_tavily_results = tavily_results[:tavily_count] if tavily_results and tavily_count else None
+    extra = _extra_results_to_sources(selected_tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
     await _SOURCES_CACHE.set(session_id, all_sources)
 

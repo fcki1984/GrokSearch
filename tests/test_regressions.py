@@ -129,8 +129,75 @@ async def test_web_search_runs_grok_and_tavily_concurrently_and_grok_wins(monkey
         "sources_count": 1,
         "content_source": "grok",
     }
-    assert tavily_calls == [("query", 1)]
+    assert tavily_calls == [("query", 5)]
     assert cached["sources"][0]["provider"] == "tavily"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_sources", [None, 0])
+async def test_tavily_standby_falls_back_with_default_or_zero_extras(monkeypatch, extra_sources):
+    monkeypatch.setenv("GROK_API_URL", "https://grok.invalid")
+    monkeypatch.setenv("GROK_API_KEY", "test-grok-key")
+    monkeypatch.setenv("TAVILY_ENABLED", "true")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    tavily_calls = []
+
+    async def grok_search(self, query, platform=""):
+        return ""
+
+    async def tavily_search(query, max_results=6):
+        tavily_calls.append((query, max_results))
+        return [{"title": "Standby", "url": "https://tavily.invalid/standby", "content": "fallback"}]
+
+    async def unexpected_firecrawl_search(query, limit=14):
+        raise AssertionError("Firecrawl must not run with zero supplementary sources")
+
+    monkeypatch.setattr(GrokSearchProvider, "search", grok_search)
+    monkeypatch.setattr(server, "_call_tavily_search", tavily_search)
+    monkeypatch.setattr(server, "_call_firecrawl_search", unexpected_firecrawl_search)
+
+    kwargs = {} if extra_sources is None else {"extra_sources": extra_sources}
+    result = await server.web_search("query", **kwargs)
+    cached = await server.get_sources(result["session_id"])
+
+    assert result["content_source"] == "tavily_search_fallback"
+    assert result["sources_count"] == 0
+    assert "fallback" in result["content"]
+    assert tavily_calls == [("query", 5)]
+    assert cached["sources"] == []
+
+
+@pytest.mark.asyncio
+async def test_tavily_standby_is_not_exposed_when_grok_wins_with_zero_extras(monkeypatch):
+    monkeypatch.setenv("GROK_API_URL", "https://grok.invalid")
+    monkeypatch.setenv("GROK_API_KEY", "test-grok-key")
+    monkeypatch.setenv("TAVILY_ENABLED", "true")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    tavily_calls = []
+
+    async def grok_search(self, query, platform=""):
+        return "Grok answer"
+
+    async def tavily_search(query, max_results=6):
+        tavily_calls.append((query, max_results))
+        return [{"title": "Standby", "url": "https://tavily.invalid/standby", "content": "hidden"}]
+
+    monkeypatch.setattr(GrokSearchProvider, "search", grok_search)
+    monkeypatch.setattr(server, "_call_tavily_search", tavily_search)
+
+    result = await server.web_search("query", extra_sources=0)
+    cached = await server.get_sources(result["session_id"])
+
+    assert result == {
+        "session_id": result["session_id"],
+        "content": "Grok answer",
+        "sources_count": 0,
+        "content_source": "grok",
+    }
+    assert tavily_calls == [("query", 5)]
+    assert cached["sources"] == []
 
 
 @pytest.mark.asyncio
@@ -354,39 +421,45 @@ async def test_outer_cancellation_cancels_unfinished_children(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_all_firecrawl_allocation_cannot_supply_fallback_body(monkeypatch):
+async def test_all_firecrawl_allocation_keeps_standby_out_of_cached_sources(monkeypatch):
     monkeypatch.setenv("GROK_API_URL", "https://grok.invalid")
     monkeypatch.setenv("GROK_API_KEY", "test-grok-key")
     monkeypatch.setenv("TAVILY_ENABLED", "true")
     monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "test-firecrawl-key")
     monkeypatch.setattr(server, "new_session_id", lambda: "firecrawl-only-session")
-    calls = []
+    firecrawl_calls = []
+    tavily_calls = []
 
     async def grok_search(self, query, platform=""):
         return ""
 
     async def tavily_search(query, max_results=6):
-        raise AssertionError("Tavily must not be allocated when Firecrawl is configured")
+        tavily_calls.append((query, max_results))
+        return [{"title": "Tavily", "url": "https://tavily.invalid/1", "content": "fallback"}]
 
     async def firecrawl_search(query, limit=14):
-        calls.append((query, limit))
+        firecrawl_calls.append((query, limit))
         return [{"title": "Firecrawl", "url": "https://firecrawl.invalid/1", "description": "must not become fallback"}]
 
     monkeypatch.setattr(GrokSearchProvider, "search", grok_search)
     monkeypatch.setattr(server, "_call_tavily_search", tavily_search)
     monkeypatch.setattr(server, "_call_firecrawl_search", firecrawl_search)
 
-    with pytest.raises(ToolError, match="no Tavily fallback"):
-        await server.web_search("query", extra_sources=3)
+    result = await server.web_search("query", extra_sources=3)
 
     cached = await server.get_sources("firecrawl-only-session")
-    assert calls == [("query", 3)]
+    assert result["content_source"] == "tavily_search_fallback"
+    assert result["sources_count"] == 1
+    assert "fallback" in result["content"]
+    assert tavily_calls == [("query", 5)]
+    assert firecrawl_calls == [("query", 3)]
     assert any(
         source.get("provider") == "firecrawl"
         and source.get("description") == "must not become fallback"
         for source in cached["sources"]
     )
+    assert all(source.get("provider") != "tavily" for source in cached["sources"])
 
 
 def test_tavily_fallback_formatter_filters_dedupes_and_caps_raw_content():
