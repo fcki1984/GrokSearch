@@ -487,7 +487,7 @@ async def web_fetch(
     await log_info(ctx, "Fetch Failed!", config.debug_enabled)
     if not config.tavily_api_key and not config.firecrawl_api_key:
         return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
-    return "提取失败: 所有提取服务均未能获取内容"
+    raise ToolError("提取失败: 所有提取服务均未能获取内容")
 
 
 async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 1,
